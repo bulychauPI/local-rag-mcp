@@ -7,7 +7,8 @@ from rich.markdown import Markdown
 
 # Add current directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent))
-from rag.query import retrieve, build_prompt, ask_llm
+from rag.query import hybrid_retrieve, build_prompt, ask_llm
+from rag.query_expansion import generate_keywords
 from mcp.client import MCPClient
 from config import OLLAMA_MODEL
 
@@ -118,14 +119,28 @@ Your JSON response:"""
             return f"Error calling MCP tool {tool_name}: {str(e)}"
     
     def query(self, user_query: str, verbose=False):
-        """Answer a question using RAG and optionally MCP tools."""
-        # Step 1: Retrieve from RAG
-        contexts = retrieve(user_query)
-        
+        """Answer a question using hybrid RAG and optionally MCP tools."""
+        # Step 1: Query expansion - ask the LLM for keywords (falls back to [])
+        keywords = generate_keywords(user_query)
+
         if verbose:
-            print(f"📚 Retrieved {len(contexts)} relevant chunks from knowledge base")
+            if keywords:
+                print(f"🔑 Keywords: {', '.join(keywords)}")
+            else:
+                print("🔑 No keywords generated - using the original query only")
+
+        # Step 2: Vector search and BM25 in parallel, fused with RRF
+        contexts, stats = hybrid_retrieve(user_query, keywords=keywords)
+
+        if verbose:
+            print(
+                f"📚 Retrieved {len(contexts)} chunks "
+                f"(vector: {stats['vector_hits']} in {stats['vector_ms']:.0f}ms, "
+                f"fts: {stats['fts_hits']} in {stats['fts_ms']:.0f}ms, "
+                f"parallel total: {stats['total_ms']:.0f}ms)"
+            )
         
-        # Step 2: Ask LLM if MCP tools are needed
+        # Step 3: Ask LLM if MCP tools are needed
         mcp_result = None
         mcp_tool_used = None
         tool_name, tool_args = self._llm_decide_mcp_usage(user_query, contexts)
@@ -138,24 +153,26 @@ Your JSON response:"""
             if verbose and mcp_result:
                 print(f"✅ MCP tool returned result (length: {len(mcp_result)} chars)")
         
-        # Step 3: Build prompt with RAG context
+        # Step 4: Build prompt with RAG context
         prompt = build_prompt(user_query, contexts)
         
-        # Step 4: Add MCP result if available
+        # Step 5: Add MCP result if available
         if mcp_result:
             prompt += f"\n\n<additional_info_from_mcp_tool>\n{mcp_result}\n</additional_info_from_mcp_tool>\n"
         
-        # Step 5: Generate answer
+        # Step 6: Generate answer
         answer = ask_llm(prompt)
         
-        # Step 6: Prepare response with sources
+        # Step 7: Prepare response with sources
         sources = [c["source"] for c in contexts] if contexts else []
         
         return {
             "answer": answer,
             "sources": sources,
             "mcp_used": mcp_result is not None,
-            "mcp_tool": mcp_tool_used
+            "mcp_tool": mcp_tool_used,
+            "keywords": keywords,
+            "retrieval_stats": stats
         }
     
     def close(self):

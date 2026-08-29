@@ -12,8 +12,8 @@ Run these commands in order to set up and use the Company Knowledge Base Assista
    
    # Or download from https://ollama.ai
    
-   # Pull the model
-   ollama pull llama3
+   # Pull the model (any Qwen3 0.6B-3B works)
+   ollama pull qwen3:1.7b
    ```
 
 ## Setup Steps
@@ -44,6 +44,9 @@ Add your company documentation files (`.txt`, `.md`, `.pdf`, `.docx`) to the `do
 ```bash
 # Example: Copy some sample documents
 # cp /path/to/company/docs/* docs/
+
+# Or start from the bundled samples (rare terms, commands, incident IDs)
+cp sample-docs/*.md docs/
 ```
 
 ### 6. Update configuration (optional)
@@ -88,6 +91,19 @@ Then ask questions like:
 
 Type `exit` or `quit` to stop.
 
+## Tests and Benchmark
+
+Run the unit tests for query expansion, BM25 and RRF:
+```bash
+python tests/test_hybrid.py
+```
+
+Compare vector-only retrieval against the hybrid pipeline on a built-in corpus
+(it does not touch your own index):
+```bash
+python benchmark.py
+```
+
 ## Updating the Knowledge Base
 
 When you add new documents or update existing ones:
@@ -111,7 +127,9 @@ When you add new documents or update existing ones:
 
 ### Ollama connection errors
 - Make sure Ollama is running: `ollama list`
-- Verify the model is installed: `ollama pull llama3`
+- Verify the model is installed: `ollama pull qwen3:1.7b`
+- Keyword generation degrades gracefully: if Ollama is unreachable the search
+  falls back to the raw question instead of failing
 - Check `OLLAMA_URL` in `config.py` (default: `http://localhost:11434/api/generate`)
 
 ### MCP client errors
