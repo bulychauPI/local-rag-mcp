@@ -63,9 +63,44 @@ A **local, intelligent Q&A system** using:
 2. Chunking → Split into 700-char chunks
 3. Embedding → Use SentenceTransformers
 4. Indexing → Build FAISS vector index
-5. Query → Retrieve top 5 similar chunks
-6. Prompt Building → Create context-aware prompt
-7. LLM Generation → Get answer from model
+5. Query Expansion → LLM extracts keywords from the question
+6. Hybrid Retrieval → Vector search + BM25 in parallel, fused with RRF
+7. Prompt Building → Create context-aware prompt
+8. LLM Generation → Get answer from model
+
+# 🔀 Hybrid Search (Vector + Full-Text)
+
+Vector similarity alone loses rare terms, abbreviations, identifiers and file
+names — the embedding of "INC-4473" is nearly identical to that of "INC-4471".
+Retrieval therefore runs two retrievers over the *same* chunk list:
+
+```
+          User question
+                │
+    ┌───────────┴──────────────┐
+    │  LLM keyword generation  │  temperature 0, comma-separated output,
+    └───────────┬──────────────┘  falls back to the raw question on any failure
+                │
+        ┌───────┴────────┐        both branches run concurrently
+        ▼                ▼        in a ThreadPoolExecutor
+  Vector search      BM25 / FTS
+  (FAISS, question)  (question + keywords)
+        └───────┬────────┘
+                ▼
+   Reciprocal Rank Fusion (k = 60)
+                ▼
+          Top-K chunks → LLM / MCP
+```
+
+- **Same id space.** Both retrievers return positions in the global `chunks`
+  list, so RRF recognises a chunk found by both and rewards it.
+- **Candidate depth.** Each retriever contributes `CANDIDATE_K = 20`
+  candidates; fusion then trims to `TOP_K = 5`.
+- **Fallback everywhere.** Bad keyword formats, a `<think>` block, a dead
+  Ollama or a failing branch all degrade to a working search instead of an
+  exception.
+
+`RRF_Score(d) = Σ_m weight_m / (k + rank_m(d))`, with `k = 60`.
 
 # 🔍 Why FAISS?
 
@@ -110,15 +145,21 @@ src/
 ├── config.py           Configuration
 ├── main.py             CLI entry point
 ├── assistant.py        Main orchestrator
+├── benchmark.py        Vector-only vs hybrid comparison
 ├── rag/
 │   ├── ingest.py      Load documents
 │   ├── chunk.py       Split text
 │   ├── embed.py       Generate embeddings
 │   ├── build_index.py Build FAISS index
-│   └── query.py       Retrieve & generate
+│   ├── query_expansion.py  LLM keyword generation + fallbacks
+│   ├── fts.py         BM25 full-text search
+│   ├── fusion.py      Reciprocal Rank Fusion
+│   └── query.py       Hybrid retrieval & generation
 ├── mcp/
 │   ├── server.py      MCP tool definitions
 │   └── client.py      MCP client wrapper
+├── tests/
+│   └── test_hybrid.py Tests for expansion, FTS and RRF
 └── docs/              Documentation
 ```
 
@@ -143,9 +184,11 @@ $ python main.py build-index
 ```
 User Question
   ↓
-Embed question
+LLM extracts keywords (temperature 0)
   ↓
-Search FAISS → Top 5 chunks
+Vector search ‖ BM25 search (parallel, 20 candidates each)
+  ↓
+Reciprocal Rank Fusion → Top 5 chunks
   ↓
 LLM decides: Use MCP tools?
   ↓
@@ -158,6 +201,8 @@ Return answer + sources
 
 # ✨ Core Features
 
+- **Hybrid Search**: Vector similarity + BM25, fused with RRF
+- **Query Expansion**: LLM-generated keywords sharpen the full-text branch
 - **Semantic Search**: Find by meaning, not keywords
 - **Multi-format**: .md, .txt, .pdf, .docx files
 - **Source Attribution**: Shows document sources
@@ -171,8 +216,16 @@ Return answer + sources
 CHUNK_SIZE = 700
 CHUNK_OVERLAP = 100
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-OLLAMA_MODEL = "qwen3:0.6b"
+OLLAMA_MODEL = "qwen3:1.7b"
 TOP_K = 5
+
+# Hybrid search
+CANDIDATE_K = 20            # candidates per retriever before fusion
+RRF_K = 60                  # RRF damping constant
+VECTOR_WEIGHT = 1.0         # weight of the vector branch in RRF
+FTS_WEIGHT = 1.0            # weight of the BM25 branch in RRF
+ENABLE_QUERY_EXPANSION = True
+KEYWORD_TEMPERATURE = 0.0   # deterministic keywords for small models
 ```
 
 # 🎬 Live Demo - Starting
@@ -343,6 +396,12 @@ Docs     Index      Build
 # 🙋 Quick Reference
 
 ```bash
+# Run the tests
+python tests/test_hybrid.py
+
+# Compare vector-only vs hybrid retrieval
+python benchmark.py
+
 # Build index
 python main.py build-index
 

@@ -2,6 +2,8 @@ import faiss
 import pickle
 import requests
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
 
@@ -13,8 +15,15 @@ from config import (
     EMBEDDING_MODEL,
     OLLAMA_URL,
     OLLAMA_MODEL,
-    TOP_K
+    TOP_K,
+    CANDIDATE_K,
+    RRF_K,
+    VECTOR_WEIGHT,
+    FTS_WEIGHT,
 )
+from rag.fts import fts_search, reset as reset_fts
+from rag.fusion import reciprocal_rank_fusion
+from rag.query_expansion import build_fts_query
 
 model = SentenceTransformer(EMBEDDING_MODEL)
 
@@ -38,6 +47,7 @@ def _ensure_index_exists():
             index = faiss.read_index(str(index_path))
             with open(chunks_path, "rb") as f:
                 chunks = pickle.load(f)
+            reset_fts()
             return True
         except Exception as e:
             print(f"⚠️  Warning: Error loading existing index: {e}")
@@ -54,6 +64,7 @@ def _ensure_index_exists():
             index = faiss.read_index(str(index_path))
             with open(chunks_path, "rb") as f:
                 chunks = pickle.load(f)
+            reset_fts()
             print("✅ Index built and loaded successfully")
             return True
         else:
@@ -73,21 +84,100 @@ def _ensure_index_exists():
 _ensure_index_exists()
 
 
-def retrieve(query: str):
-    """Retrieve relevant chunks for a query."""
-    # Ensure index exists before retrieving
+# Two workers: the vector branch and the FTS branch run concurrently. Both
+# release the GIL for most of their work (FAISS C++ / numpy), so threads are
+# enough and every caller stays synchronous. Created once, not per query.
+_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="hybrid-search")
+
+
+def _index_ready():
+    """Load the index on demand; return False if there is nothing to search."""
     if index is None or len(chunks) == 0:
         if not _ensure_index_exists():
-            return []
-    
-    if index is None or len(chunks) == 0:
-        return []
-    
+            return False
+    return index is not None and len(chunks) > 0
+
+
+def vector_search(query: str, top_k: int = CANDIDATE_K):
+    """Rank chunk indices by embedding similarity. Returns indices, best first."""
     q_emb = model.encode([query])
     faiss.normalize_L2(q_emb)
 
-    scores, ids = index.search(q_emb, TOP_K)
-    return [chunks[i] for i in ids[0]]
+    scores, ids = index.search(q_emb, min(top_k, index.ntotal))
+    # FAISS pads with -1 when fewer than top_k vectors exist; chunks[-1] would
+    # silently return the last chunk.
+    return [int(i) for i in ids[0] if 0 <= i < len(chunks)]
+
+
+def hybrid_retrieve(query: str, keywords=None, top_k: int = TOP_K,
+                    candidate_k: int = CANDIDATE_K):
+    """Retrieve chunks with vector search and BM25 in parallel, fused by RRF.
+
+    Args:
+        query: the original user question (used verbatim for vector search).
+        keywords: optional keywords from query expansion, appended to the FTS
+            query only - embeddings work better on the natural question.
+        top_k: how many chunks to return after fusion.
+        candidate_k: how many candidates each retriever contributes to fusion.
+
+    Returns:
+        (contexts, stats) where contexts is a list of chunk dicts and stats
+        carries per-branch timings and hit counts for verbose output.
+    """
+    stats = {
+        "vector_hits": 0, "fts_hits": 0, "fused_hits": 0,
+        "vector_ms": 0.0, "fts_ms": 0.0, "total_ms": 0.0,
+        "keywords": list(keywords or []),
+    }
+
+    if not _index_ready():
+        return [], stats
+
+    snapshot = chunks  # bind once: both branches must see the same list
+    fts_query = build_fts_query(query, keywords)
+
+    def run_vector():
+        started = time.perf_counter()
+        try:
+            return vector_search(query, candidate_k), (time.perf_counter() - started) * 1000
+        except Exception as e:
+            print(f"⚠️  Vector search failed: {e}")
+            return [], (time.perf_counter() - started) * 1000
+
+    def run_fts():
+        started = time.perf_counter()
+        try:
+            return fts_search(fts_query, snapshot, candidate_k), (time.perf_counter() - started) * 1000
+        except Exception as e:
+            print(f"⚠️  Full-text search failed: {e}")
+            return [], (time.perf_counter() - started) * 1000
+
+    started = time.perf_counter()
+    vector_future = _executor.submit(run_vector)
+    fts_future = _executor.submit(run_fts)
+    vector_ids, stats["vector_ms"] = vector_future.result()
+    fts_ids, stats["fts_ms"] = fts_future.result()
+    stats["total_ms"] = (time.perf_counter() - started) * 1000
+
+    stats["vector_hits"] = len(vector_ids)
+    stats["fts_hits"] = len(fts_ids)
+
+    # Both branches speak the same id space (positions in `chunks`), so RRF can
+    # recognise a chunk found by both and reward it.
+    fused = reciprocal_rank_fusion(
+        [vector_ids, fts_ids],
+        k=RRF_K,
+        weights=[VECTOR_WEIGHT, FTS_WEIGHT],
+        top_k=top_k,
+    )
+    stats["fused_hits"] = len(fused)
+    return [snapshot[i] for i, _ in fused], stats
+
+
+def retrieve(query: str, keywords=None, top_k: int = TOP_K):
+    """Retrieve relevant chunks for a query (hybrid vector + BM25)."""
+    contexts, _ = hybrid_retrieve(query, keywords=keywords, top_k=top_k)
+    return contexts
 
 
 def build_prompt(query, contexts):
@@ -125,22 +215,36 @@ def build_prompt(query, contexts):
 """
 
 
-def ask_llm(prompt):
-    """Query Ollama LLM."""
-    response = requests.post(
-        OLLAMA_URL,
-        json={
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "stream": False
-        }
-    )
+def ask_llm(prompt, options=None):
+    """Query Ollama LLM.
+
+    `options` is passed through to Ollama (temperature, num_predict, ...). The
+    non-Ollama key "timeout" is consumed here as the HTTP timeout.
+    """
+    options = dict(options or {})
+    timeout = options.pop("timeout", None)
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        # qwen3 emits <think> blocks by default; they only cost tokens here.
+        "think": False,
+    }
+    if options:
+        payload["options"] = options
+
+    response = requests.post(OLLAMA_URL, json=payload, timeout=timeout)
+    response.raise_for_status()
     return response.json()["response"]
 
 
 def ask(query: str):
-    """Answer a question using RAG."""
-    contexts = retrieve(query)
+    """Answer a question using the full hybrid RAG pipeline."""
+    from rag.query_expansion import generate_keywords
+
+    keywords = generate_keywords(query)
+    contexts = retrieve(query, keywords=keywords)
     prompt = build_prompt(query, contexts)
     return ask_llm(prompt), contexts
 
